@@ -5,12 +5,10 @@ on:
   push:
     branches:
       - main
-    paths:
-      - "Gboard-iOS-ENG-RUS-Bottom-Row-Morphe-FIXED-1.patch"
-      - ".github/workflows/**"
 
 permissions:
   contents: read
+  packages: read
 
 jobs:
   build:
@@ -28,18 +26,18 @@ jobs:
           ref: main
           path: gboard-patches
 
-      - name: Verify patch file exists
+      - name: Verify patch file
         shell: bash
         run: |
           set -euo pipefail
           PATCH="$GITHUB_WORKSPACE/Gboard-iOS-ENG-RUS-Bottom-Row-Morphe-FIXED-1.patch"
-          test -f "$PATCH" || {
-            echo "::error::Patch file not found: $PATCH"
+          if [ ! -f "$PATCH" ]; then
+            echo "::error::Patch file not found"
             ls -la "$GITHUB_WORKSPACE"
             exit 1
-          }
+          fi
 
-      - name: Apply the independent EN/RU patch
+      - name: Apply EN/RU patch
         working-directory: gboard-patches
         shell: bash
         run: |
@@ -57,15 +55,18 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Test and build Morphe bundle
+      - name: Build Morphe bundle
         working-directory: gboard-patches
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.MORPHE_GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
           chmod +x ./gradlew
           ./gradlew :patches:buildAndroid generatePatchesList
 
-      - name: Upload Morphe patch bundle
+      - name: Upload Morphe bundle
         uses: actions/upload-artifact@v4
         with:
           name: gboard-ios-eng-rus-bottom-row-morphe
