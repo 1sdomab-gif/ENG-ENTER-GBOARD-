@@ -1,0 +1,661 @@
+diff --git a/extensions/extension/src/main/java/dev/jason/gboardpatches/extension/iosbottomrow/GboardIosBottomRowRuntime.java b/extensions/extension/src/main/java/dev/jason/gboardpatches/extension/iosbottomrow/GboardIosBottomRowRuntime.java
+new file mode 100644
+index 0000000..293c1b9
+--- /dev/null
++++ b/extensions/extension/src/main/java/dev/jason/gboardpatches/extension/iosbottomrow/GboardIosBottomRowRuntime.java
+@@ -0,0 +1,243 @@
++package dev.jason.gboardpatches.extension.iosbottomrow;
++
++import android.content.Context;
++import android.content.ContextWrapper;
++import android.inputmethodservice.InputMethodService;
++import android.text.InputType;
++import android.util.Log;
++import android.view.View;
++import android.view.ViewGroup;
++import android.view.ViewParent;
++import android.view.inputmethod.EditorInfo;
++import android.view.inputmethod.InputMethodSubtype;
++import android.widget.LinearLayout;
++
++import java.util.Locale;
++import java.util.Map;
++import java.util.WeakHashMap;
++
++/**
++ * Independent iOS-style bottom-row runtime. It owns its preferences and does not call or
++ * modify any other feature runtime. It changes weights only on the ordinary Latin footer.
++ */
++@SuppressWarnings("unused")
++public final class GboardIosBottomRowRuntime {
++    private static final String TAG = "GboardIosBottomRow";
++    private static final String KEYBOARD_ROOT_CLASS =
++            "com.google.android.libraries.inputmethod.widgets.SoftKeyboardView";
++    private static final String SWITCH_TO_SYMBOL_SLOT = "key_pos_switch_to_symbol";
++    private static final String SWITCH_TO_ALPHA_SLOT = "key_pos_switch_to_alpha";
++    private static final String[] SLOT_NAMES = {
++            SWITCH_TO_SYMBOL_SLOT, "A02", "key_pos_switch_to_next_language",
++            "key_pos_space", "A06", "key_pos_del", "key_pos_ime_action"
++    };
++    private static final Map<View, Float> ORIGINAL_WEIGHTS = new WeakHashMap<>();
++
++    private GboardIosBottomRowRuntime() { }
++
++    public static void afterSoftKeyBound(Object receiver) {
++        if (!(receiver instanceof View keyView)) return;
++        try {
++            Footer footer = findFooter(keyView);
++            if (footer == null) return;
++
++            InputMethodService service = findInputMethodService(keyView.getContext());
++            boolean enabled = GboardIosBottomRowSettings.isEnabled(keyView.getContext());
++            EditorInfo editor = service == null ? null : service.getCurrentInputEditorInfo();
++            InputMethodSubtype subtype = service == null ? null : service.getCurrentInputMethodSubtype();
++            boolean eligible = enabled && isEnglishOrRussian(subtype) && isEligibleEditor(editor);
++            if (!eligible) {
++                restoreOriginalWeights(footer);
++                return;
++            }
++
++            boolean uri = isUriEditor(editor);
++            // Relative weights: ?123/ABC=2, comma=1, globe=1, space=3, period=1,
++            // delete=1, Enter=2 (URI Enter=1.5). Cluster weights equal their children.
++            float enterWeight = uri ? 150f : 200f;
++            View[] targets = {
++                    footer.slots[0], footer.slots[1], footer.middle,
++                    footer.slots[2], footer.spaceCluster, footer.slots[3],
++                    footer.slots[4], footer.slots[5], footer.slots[6]
++            };
++            float[] weights = { 200f, 100f, 500f, 100f, 400f, 300f, 100f, 100f, enterWeight };
++            if (applyWeights(targets, weights)) {
++                footer.root.requestLayout();
++                footer.middle.requestLayout();
++                footer.spaceCluster.requestLayout();
++            }
++        } catch (Throwable error) {
++            Log.w(TAG, "Could not apply independent iOS-style bottom-row weights", error);
++        }
++    }
++
++    private static InputMethodService findInputMethodService(Context context) {
++        Context current = context;
++        for (int depth = 0; current != null && depth < 12; depth++) {
++            if (current instanceof InputMethodService service) return service;
++            if (!(current instanceof ContextWrapper wrapper)) break;
++            Context next = wrapper.getBaseContext();
++            if (next == current) break;
++            current = next;
++        }
++        return null;
++    }
++
++    private static boolean isEnglishOrRussian(InputMethodSubtype subtype) {
++        if (subtype == null) return false;
++        String mode = subtype.getMode();
++        if (mode != null && !mode.isEmpty() && !"keyboard".equalsIgnoreCase(mode)) return false;
++        String localeTag = subtype.getLocale();
++        if (localeTag == null || localeTag.isEmpty()) return false;
++        Locale locale = Locale.forLanguageTag(localeTag.replace('_', '-'));
++        String language = locale.getLanguage();
++        return "en".equalsIgnoreCase(language) || "ru".equalsIgnoreCase(language);
++    }
++
++    private static boolean isEligibleEditor(EditorInfo editor) {
++        if (editor == null) return false;
++        int inputClass = editor.inputType & InputType.TYPE_MASK_CLASS;
++        if (inputClass != InputType.TYPE_CLASS_TEXT) return false;
++        int variation = editor.inputType & InputType.TYPE_MASK_VARIATION;
++        return variation == InputType.TYPE_TEXT_VARIATION_NORMAL
++                || variation == InputType.TYPE_TEXT_VARIATION_URI
++                || variation == InputType.TYPE_TEXT_VARIATION_WEB_EDIT_TEXT;
++    }
++
++    private static boolean isUriEditor(EditorInfo editor) {
++        if (editor == null) return false;
++        int variation = editor.inputType & InputType.TYPE_MASK_VARIATION;
++        return variation == InputType.TYPE_TEXT_VARIATION_URI
++                || variation == InputType.TYPE_TEXT_VARIATION_WEB_EDIT_TEXT;
++    }
++
++    private static Footer findFooter(View keyView) {
++        // Never search arbitrary ancestors: only inspect a footer inside Gboard's keyboard root.
++        // The exact slot IDs and nested structure below further limit this to the ordinary Latin row.
++        ViewGroup root = findKeyboardRoot(keyView);
++        return root == null ? null : findFooterInTree(root);
++    }
++
++    private static ViewGroup findKeyboardRoot(View view) {
++        ViewParent parent = view == null ? null : view.getParent();
++        while (parent instanceof ViewGroup group) {
++            if (KEYBOARD_ROOT_CLASS.equals(group.getClass().getName())
++                    || "SoftKeyboardView".equals(group.getClass().getSimpleName())) return group;
++            parent = group.getParent();
++        }
++        return null;
++    }
++
++    private static Footer findFooterInTree(View view) {
++        if (!(view instanceof ViewGroup group)) return null;
++        Footer here = buildFooter(group);
++        if (here != null) return here;
++        for (int i = 0; i < group.getChildCount(); i++) {
++            Footer nested = findFooterInTree(group.getChildAt(i));
++            if (nested != null) return nested;
++        }
++        return null;
++    }
++
++    private static Footer buildFooter(ViewGroup root) {
++        if (root.getChildCount() != 5) return null;
++        View switchKey = root.getChildAt(0);
++        View comma = root.getChildAt(1);
++        View middleView = root.getChildAt(2);
++        View delete = root.getChildAt(3);
++        View enter = root.getChildAt(4);
++        // The same dedicated policy covers both sides of the normal Latin symbol toggle:
++        // ?123 while typing letters and ABC/АБВ while viewing the ordinary symbols page.
++        if (!isSwitchKey(switchKey) || !hasSlot(comma, SLOT_NAMES[1])
++                || !hasSlot(delete, SLOT_NAMES[5]) || !hasSlot(enter, SLOT_NAMES[6])) return null;
++        if (!(middleView instanceof ViewGroup middle) || middle.getChildCount() != 2) return null;
++        View globe = middle.getChildAt(0);
++        View spaceView = middle.getChildAt(1);
++        if (!hasSlot(globe, SLOT_NAMES[2]) || !(spaceView instanceof ViewGroup spaceCluster)
++                || spaceCluster.getChildCount() != 2) return null;
++        View space = spaceCluster.getChildAt(0);
++        View period = spaceCluster.getChildAt(1);
++        if (!hasSlot(space, SLOT_NAMES[3]) || !hasSlot(period, SLOT_NAMES[4])) return null;
++        return new Footer(root, middle, spaceCluster,
++                new View[] { switchKey, comma, globe, space, period, delete, enter });
++    }
++
++    private static boolean isSwitchKey(View view) {
++        return hasSlot(view, SWITCH_TO_SYMBOL_SLOT) || hasSlot(view, SWITCH_TO_ALPHA_SLOT);
++    }
++
++    private static boolean hasSlot(View view, String expected) {
++        if (view == null || view.getId() == View.NO_ID) return false;
++        try {
++            return expected.equals(view.getResources().getResourceEntryName(view.getId()));
++        } catch (Throwable ignored) {
++            return false;
++        }
++    }
++
++    private static boolean applyWeights(View[] views, float[] weights) {
++        LinearLayout.LayoutParams[] params = resolveParams(views);
++        if (params == null) return false;
++        synchronized (ORIGINAL_WEIGHTS) {
++            for (int i = 0; i < views.length; i++) ORIGINAL_WEIGHTS.putIfAbsent(views[i], params[i].weight);
++        }
++        boolean changed = false;
++        for (int i = 0; i < views.length; i++) {
++            if (Float.compare(params[i].weight, weights[i]) != 0) {
++                params[i].weight = weights[i];
++                views[i].setLayoutParams(params[i]);
++                changed = true;
++            }
++        }
++        return changed;
++    }
++
++    private static void restoreOriginalWeights(Footer footer) {
++        View[] views = { footer.slots[0], footer.slots[1], footer.middle,
++                footer.slots[2], footer.spaceCluster, footer.slots[3], footer.slots[4],
++                footer.slots[5], footer.slots[6] };
++        boolean changed = false;
++        synchronized (ORIGINAL_WEIGHTS) {
++            for (View view : views) {
++                Float original = ORIGINAL_WEIGHTS.remove(view);
++                if (original == null) continue;
++                ViewGroup.LayoutParams raw = view.getLayoutParams();
++                if (raw instanceof LinearLayout.LayoutParams params
++                        && Float.compare(params.weight, original) != 0) {
++                    params.weight = original;
++                    view.setLayoutParams(params);
++                    changed = true;
++                }
++            }
++        }
++        if (changed) {
++            footer.root.requestLayout();
++            footer.middle.requestLayout();
++            footer.spaceCluster.requestLayout();
++        }
++    }
++
++    private static LinearLayout.LayoutParams[] resolveParams(View[] views) {
++        LinearLayout.LayoutParams[] result = new LinearLayout.LayoutParams[views.length];
++        for (int i = 0; i < views.length; i++) {
++            if (views[i] == null || !(views[i].getLayoutParams() instanceof LinearLayout.LayoutParams params)) {
++                return null;
++            }
++            result[i] = params;
++        }
++        return result;
++    }
++
++    private static final class Footer {
++        final ViewGroup root;
++        final ViewGroup middle;
++        final ViewGroup spaceCluster;
++        final View[] slots;
++        Footer(ViewGroup root, ViewGroup middle, ViewGroup spaceCluster, View[] slots) {
++            this.root = root;
++            this.middle = middle;
++            this.spaceCluster = spaceCluster;
++            this.slots = slots;
++        }
++    }
++}
+diff --git a/extensions/extension/src/main/java/dev/jason/gboardpatches/extension/iosbottomrow/GboardIosBottomRowSettings.java b/extensions/extension/src/main/java/dev/jason/gboardpatches/extension/iosbottomrow/GboardIosBottomRowSettings.java
+new file mode 100644
+index 0000000..dac30d2
+--- /dev/null
++++ b/extensions/extension/src/main/java/dev/jason/gboardpatches/extension/iosbottomrow/GboardIosBottomRowSettings.java
+@@ -0,0 +1,34 @@
++package dev.jason.gboardpatches.extension.iosbottomrow;
++
++import android.content.Context;
++import android.content.SharedPreferences;
++
++/** Preferences owned only by the independent iOS-style bottom-row feature. */
++public final class GboardIosBottomRowSettings {
++    private static final String PREF_FILE = "gboard_ios_bottom_row_settings";
++    private static final String PREF_ENABLED = "ios_bottom_row_enabled";
++    private static final boolean DEFAULT_ENABLED = false;
++
++    private GboardIosBottomRowSettings() { }
++
++    public static SharedPreferences preferences(Context context) {
++        if (context == null) return null;
++        Context app = context.getApplicationContext();
++        return (app != null ? app : context).getSharedPreferences(PREF_FILE, Context.MODE_PRIVATE);
++    }
++
++    public static boolean isEnabled(Context context) {
++        SharedPreferences prefs = preferences(context);
++        if (prefs == null) return DEFAULT_ENABLED;
++        try {
++            return prefs.getBoolean(PREF_ENABLED, DEFAULT_ENABLED);
++        } catch (ClassCastException ignored) {
++            return DEFAULT_ENABLED;
++        }
++    }
++
++    public static boolean setEnabled(Context context, boolean enabled) {
++        SharedPreferences prefs = preferences(context);
++        return prefs != null && prefs.edit().putBoolean(PREF_ENABLED, enabled).commit();
++    }
++}
+diff --git a/extensions/extension/src/main/java/dev/jason/gboardpatches/extension/iosbottomrow/GboardIosBottomRowSettingsFeature.java b/extensions/extension/src/main/java/dev/jason/gboardpatches/extension/iosbottomrow/GboardIosBottomRowSettingsFeature.java
+new file mode 100644
+index 0000000..87b8908
+--- /dev/null
++++ b/extensions/extension/src/main/java/dev/jason/gboardpatches/extension/iosbottomrow/GboardIosBottomRowSettingsFeature.java
+@@ -0,0 +1,62 @@
++package dev.jason.gboardpatches.extension.iosbottomrow;
++
++import android.content.Context;
++import android.util.Log;
++
++import java.util.Collections;
++
++import dev.jason.gboardpatches.extension.R;
++import dev.jason.gboardpatches.extension.settings.GboardPatchesFeatureAvailability;
++import dev.jason.gboardpatches.extension.settings.GboardPatchesSettingsContract;
++import dev.jason.gboardpatches.extension.settings.GboardSettingsText;
++
++public final class GboardIosBottomRowSettingsFeature
++        implements GboardPatchesSettingsContract.Feature {
++    private static final String TAG = "GboardPatches";
++    private final String title;
++    private final String summary;
++    private final String badge;
++    private final String sectionTitle;
++    private final String toggleTitle;
++    private final String toggleSummary;
++
++    public GboardIosBottomRowSettingsFeature(Context context) {
++        title = GboardSettingsText.get(context, R.string.gboard_patches_ios_bottom_row_title);
++        summary = GboardSettingsText.get(context, R.string.gboard_patches_ios_bottom_row_summary);
++        badge = GboardSettingsText.get(context, R.string.gboard_patches_header_badge);
++        sectionTitle = GboardSettingsText.get(context, R.string.gboard_patches_ios_bottom_row_section);
++        toggleTitle = GboardSettingsText.get(context, R.string.gboard_patches_ios_bottom_row_enabled_title);
++        toggleSummary = GboardSettingsText.get(context, R.string.gboard_patches_ios_bottom_row_enabled_summary);
++    }
++
++    @Override public String getEntryTitle() { return title; }
++    @Override public String getEntrySummary() { return summary; }
++
++    @Override public boolean isAvailable(Context context) {
++        return GboardPatchesFeatureAvailability.hasFeature(
++                context, GboardPatchesFeatureAvailability.FEATURE_IOS_BOTTOM_ROW);
++    }
++
++    @Override public GboardPatchesSettingsContract.Screen buildScreen(
++            GboardPatchesSettingsContract.FeatureHost host) {
++        if (host == null || host.getContext() == null) {
++            return new GboardPatchesSettingsContract.Screen(
++                    title, badge, title, summary, Collections.emptyList());
++        }
++        Context context = host.getContext();
++        boolean enabled = GboardIosBottomRowSettings.isEnabled(context);
++        GboardPatchesSettingsContract.ToggleRow row = new GboardPatchesSettingsContract.ToggleRow(
++                toggleTitle, toggleSummary, true, enabled, value -> {
++                    if (!GboardIosBottomRowSettings.setEnabled(context, value)) {
++                        Log.w(TAG, "Could not save iOS bottom-row setting");
++                    }
++                    GboardPatchesSettingsContract.refresh(host);
++                });
++        return new GboardPatchesSettingsContract.Screen(
++                title, badge, title, summary, Collections.emptyList(),
++                Collections.singletonList(new GboardPatchesSettingsContract.Section(
++                        sectionTitle, Collections.singletonList(row))),
++                GboardPatchesSettingsContract.RefreshPolicy.none(),
++                GboardPatchesSettingsContract.PanelStyle.FLAT);
++    }
++}
+diff --git a/extensions/extension/src/main/java/dev/jason/gboardpatches/extension/keyboard/GboardKeyboardLayoutSettingsGroupFeature.java b/extensions/extension/src/main/java/dev/jason/gboardpatches/extension/keyboard/GboardKeyboardLayoutSettingsGroupFeature.java
+index 63c56d7..6714bd4 100644
+--- a/extensions/extension/src/main/java/dev/jason/gboardpatches/extension/keyboard/GboardKeyboardLayoutSettingsGroupFeature.java
++++ b/extensions/extension/src/main/java/dev/jason/gboardpatches/extension/keyboard/GboardKeyboardLayoutSettingsGroupFeature.java
+@@ -14,6 +14,7 @@ import dev.jason.gboardpatches.extension.customtheme.GboardCustomThemeSettingsFe
+ import dev.jason.gboardpatches.extension.frostedglass.GboardFrostedGlassSettingsFeature;
+ import dev.jason.gboardpatches.extension.emojisize.GboardEmojiSizeSettingsFeature;
+ import dev.jason.gboardpatches.extension.flowmode.GboardFlowModeSettingsFeature;
++import dev.jason.gboardpatches.extension.iosbottomrow.GboardIosBottomRowSettingsFeature;
+ import dev.jason.gboardpatches.extension.roundedkeyboard.GboardRoundedKeyboardSettingsFeature;
+ import dev.jason.gboardpatches.extension.settings.GboardFeatureGroup;
+ import dev.jason.gboardpatches.extension.settings.GboardPatchesSettingsContract;
+@@ -47,6 +48,7 @@ public final class GboardKeyboardLayoutSettingsGroupFeature
+                         new GboardLatinGlobeKeyIgnoreIntervalSettingsFeature(context),
+                         new GboardEnglishUppercaseToggleSettingsFeature(context),
+                         new GboardZhuyinBottomRowWeightSettingsFeature(context),
++                        new GboardIosBottomRowSettingsFeature(context),
+                         new GboardSymbolFooterOrderSettingsFeature(context),
+                         new GboardEmojiSizeSettingsFeature(context),
+                         new GboardAccessPointsMenuSettingsFeature(context),
+diff --git a/extensions/extension/src/main/java/dev/jason/gboardpatches/extension/settings/GboardPatchesFeatureAvailability.java b/extensions/extension/src/main/java/dev/jason/gboardpatches/extension/settings/GboardPatchesFeatureAvailability.java
+index fa3de9d..29124f1 100644
+--- a/extensions/extension/src/main/java/dev/jason/gboardpatches/extension/settings/GboardPatchesFeatureAvailability.java
++++ b/extensions/extension/src/main/java/dev/jason/gboardpatches/extension/settings/GboardPatchesFeatureAvailability.java
+@@ -37,6 +37,8 @@ public final class GboardPatchesFeatureAvailability {
+             "dev.jason.gboardpatches.feature.english_uppercase_toggle";
+     public static final String FEATURE_ZHUYIN_BOTTOM_ROW_WEIGHT =
+             "dev.jason.gboardpatches.feature.zhuyin_bottom_row_weight";
++    public static final String FEATURE_IOS_BOTTOM_ROW =
++            "dev.jason.gboardpatches.feature.ios_bottom_row";
+     public static final String FEATURE_AI_WRITING_TOOLS =
+             "dev.jason.gboardpatches.feature.ai_writing_tools";
+     public static final String FEATURE_TOP_ROW_SWIPE =
+diff --git a/extensions/extension/src/main/settings-text/gboard_settings_text.xml b/extensions/extension/src/main/settings-text/gboard_settings_text.xml
+index 6a99b1c..1ac7cb4 100644
+--- a/extensions/extension/src/main/settings-text/gboard_settings_text.xml
++++ b/extensions/extension/src/main/settings-text/gboard_settings_text.xml
+@@ -3250,4 +3250,24 @@
+         <translation locale="en">Editing buttons settings unavailable. Reopen settings and try again.</translation>
+         <translation locale="zh-Hant">編輯按鈕設定無法載入，請重新開啟設定再試一次。</translation>
+     </string>
++    <string name="gboard_patches_ios_bottom_row_title">
++        <translation locale="en">iOS-Style Bottom Row (English/Russian)</translation>
++        <translation locale="zh-Hant">iOS 風格底排（英文／俄文）</translation>
++    </string>
++    <string name="gboard_patches_ios_bottom_row_summary">
++        <translation locale="en">Widen the symbol/language switch and Enter keys on standard English and Russian layouts.</translation>
++        <translation locale="zh-Hant">加寬標準英文與俄文鍵盤的符號／語言切換鍵及 Enter 鍵。</translation>
++    </string>
++    <string name="gboard_patches_ios_bottom_row_section">
++        <translation locale="en">Key widths</translation>
++        <translation locale="zh-Hant">按鍵寬度</translation>
++    </string>
++    <string name="gboard_patches_ios_bottom_row_enabled_title">
++        <translation locale="en">Enable iOS-style bottom row</translation>
++        <translation locale="zh-Hant">啟用 iOS 風格底排</translation>
++    </string>
++    <string name="gboard_patches_ios_bottom_row_enabled_summary">
++        <translation locale="en">Widen ?123/ABC and Enter; use a 1.5-key Enter in URI fields. Other layouts are left unchanged.</translation>
++        <translation locale="zh-Hant">加寬 ?123／ABC 與 Enter；網址欄位使用約 1.5 鍵寬的 Enter。其他鍵盤配置不變。</translation>
++    </string>
+ </settings-text>
+diff --git a/patches/src/main/kotlin/dev/jason/gboardpatches/patches/gboard/features/iosbottomrow/GboardIosBottomRowFeatureMarkerPatch.kt b/patches/src/main/kotlin/dev/jason/gboardpatches/patches/gboard/features/iosbottomrow/GboardIosBottomRowFeatureMarkerPatch.kt
+new file mode 100644
+index 0000000..5df2dbc
+--- /dev/null
++++ b/patches/src/main/kotlin/dev/jason/gboardpatches/patches/gboard/features/iosbottomrow/GboardIosBottomRowFeatureMarkerPatch.kt
+@@ -0,0 +1,15 @@
++package dev.jason.gboardpatches.patches.gboard.features.iosbottomrow
++
++import app.morphe.patcher.patch.resourcePatch
++import dev.jason.gboardpatches.patches.gboard.features.featureflags.applyFeatureMarker
++import dev.jason.gboardpatches.patches.shared.Constants.COMPATIBILITY_GBOARD
++
++internal val gboardIosBottomRowFeatureMarkerPatch = resourcePatch(
++    description = "Mark the independent iOS-style English/Russian bottom-row feature as installed.",
++) {
++    compatibleWith(COMPATIBILITY_GBOARD)
++    finalize { applyFeatureMarker(IOS_BOTTOM_ROW_FEATURE_MARKER) }
++}
++
++internal const val IOS_BOTTOM_ROW_FEATURE_MARKER =
++    "dev.jason.gboardpatches.feature.ios_bottom_row"
+diff --git a/patches/src/main/kotlin/dev/jason/gboardpatches/patches/gboard/features/iosbottomrow/GboardIosBottomRowSoftKeyPatch.kt b/patches/src/main/kotlin/dev/jason/gboardpatches/patches/gboard/features/iosbottomrow/GboardIosBottomRowSoftKeyPatch.kt
+new file mode 100644
+index 0000000..d4e368d
+--- /dev/null
++++ b/patches/src/main/kotlin/dev/jason/gboardpatches/patches/gboard/features/iosbottomrow/GboardIosBottomRowSoftKeyPatch.kt
+@@ -0,0 +1,9 @@
++package dev.jason.gboardpatches.patches.gboard.features.iosbottomrow
++
++import dev.jason.gboardpatches.patches.gboard.shared.GboardSoftKeyFamilyFeature
++import dev.jason.gboardpatches.patches.gboard.shared.gboardSoftKeyFamilyFeaturePatch
++
++internal val gboardIosBottomRowSoftKeyPatch = gboardSoftKeyFamilyFeaturePatch(
++    description = "Apply an independent iOS-style bottom-row policy after standard Latin SoftKey binding.",
++    feature = GboardSoftKeyFamilyFeature.IOS_BOTTOM_ROW,
++)
+diff --git a/patches/src/main/kotlin/dev/jason/gboardpatches/patches/gboard/registry/GboardPatchRegistry.kt b/patches/src/main/kotlin/dev/jason/gboardpatches/patches/gboard/registry/GboardPatchRegistry.kt
+index 5d54596..cd00b24 100644
+--- a/patches/src/main/kotlin/dev/jason/gboardpatches/patches/gboard/registry/GboardPatchRegistry.kt
++++ b/patches/src/main/kotlin/dev/jason/gboardpatches/patches/gboard/registry/GboardPatchRegistry.kt
+@@ -98,6 +98,8 @@ import dev.jason.gboardpatches.patches.gboard.shared.gboardPatchesExtensionCarri
+ import dev.jason.gboardpatches.patches.gboard.shared.gboardPatchesSettingsPatch
+ import dev.jason.gboardpatches.patches.gboard.shared.accesspoint.gboardAccessPointContributions1803Patch
+ import dev.jason.gboardpatches.patches.gboard.shared.generated.GboardTargetAdmission
++import dev.jason.gboardpatches.patches.gboard.features.iosbottomrow.gboardIosBottomRowFeatureMarkerPatch
++import dev.jason.gboardpatches.patches.gboard.features.iosbottomrow.gboardIosBottomRowSoftKeyPatch
+ import dev.jason.gboardpatches.patches.gboard.features.zhuyinbottomrow.gboardZhuyinBottomRowWeightFeatureMarkerPatch
+ import dev.jason.gboardpatches.patches.gboard.features.zhuyinbottomrow.gboardZhuyinBottomRowWeightSoftKeyPatch
+ import dev.jason.gboardpatches.patches.shared.Constants.COMPATIBILITY_GBOARD
+@@ -820,6 +822,22 @@ val gboardZhuyinBottomRowWeightPatch = gboardPublicResourcePatch(
+     )
+ }
+ 
++@Suppress("unused")
++val gboardIosBottomRowPatch = gboardPublicResourcePatch(
++    featureId = "ios_style_bottom_row",
++    name = "iOS-Style Bottom Row (English/Russian)",
++    description = "Give the standard English/Russian bottom row iOS-style key widths; use a narrower Enter in URI fields.\n" +
++        "Apply iOS-style widths to the standard English/Russian bottom row, with a narrower Enter key in URI fields.",
++    default = false,
++) {
++    compatibleWith(COMPATIBILITY_GBOARD)
++    dependsOn(
++        gboardPatchesSettingsPatch,
++        gboardIosBottomRowFeatureMarkerPatch,
++        gboardIosBottomRowSoftKeyPatch,
++    )
++}
++
+ @Suppress("unused")
+ val gboardPackageRenamePatch = gboardPublicResourcePatch(
+     featureId = "package_rename",
+@@ -920,6 +938,7 @@ object GboardPublishedPatchCatalog {
+         gboardSettingsHomepagePatch,
+         gboardLatinGlobeKeyIgnoreIntervalPatch,
+         gboardZhuyinBottomRowWeightPatch,
++        gboardIosBottomRowPatch,
+         gboardPackageRenamePatch,
+         gboardSignatureBypassPatch,
+     ).filterTo(linkedSetOf()) { patch -> patch.name != null }
+diff --git a/patches/src/main/kotlin/dev/jason/gboardpatches/patches/gboard/shared/GboardSoftKeyFamilyComposer.kt b/patches/src/main/kotlin/dev/jason/gboardpatches/patches/gboard/shared/GboardSoftKeyFamilyComposer.kt
+index e53ce18..052eb7a 100644
+--- a/patches/src/main/kotlin/dev/jason/gboardpatches/patches/gboard/shared/GboardSoftKeyFamilyComposer.kt
++++ b/patches/src/main/kotlin/dev/jason/gboardpatches/patches/gboard/shared/GboardSoftKeyFamilyComposer.kt
+@@ -94,6 +94,13 @@ internal enum class GboardSoftKeyFamilyFeature(
+             RuntimeCallId.ZHUYIN_BOTTOM_ROW_WEIGHT_RUNTIME_AFTER_SOFT_KEY_BOUND,
+         ),
+     ),
++    IOS_BOTTOM_ROW(
++        beforeOrder = null,
++        afterOrder = 350,
++        afterRuntimeCalls = listOf(
++            RuntimeCallId.IOS_BOTTOM_ROW_RUNTIME_AFTER_SOFT_KEY_BOUND,
++        ),
++    ),
+     ;
+ 
+     val runtimeCalls: List<RuntimeCallId>
+@@ -353,6 +360,7 @@ internal fun GboardSoftKeyFamilyFeature.afterDelegate(): String = when (this) {
+         emitSoftKeyRuntimeCall(afterRuntimeCalls.single(), "p0, p1")
+     GboardSoftKeyFamilyFeature.TOP_ROW_SWIPE,
+     GboardSoftKeyFamilyFeature.ZHUYIN_BOTTOM_ROW,
++    GboardSoftKeyFamilyFeature.IOS_BOTTOM_ROW,
+     GboardSoftKeyFamilyFeature.ZHUYIN_TOGGLE,
+     -> emitSoftKeyRuntimeCall(afterRuntimeCalls.single(), "p0")
+     else -> error("$this has no after-stock contribution")
+diff --git a/patches/src/main/kotlin/dev/jason/gboardpatches/patches/gboard/shared/runtimeabi/RuntimeAbi.kt b/patches/src/main/kotlin/dev/jason/gboardpatches/patches/gboard/shared/runtimeabi/RuntimeAbi.kt
+index 98d8e1b..03acbcc 100644
+--- a/patches/src/main/kotlin/dev/jason/gboardpatches/patches/gboard/shared/runtimeabi/RuntimeAbi.kt
++++ b/patches/src/main/kotlin/dev/jason/gboardpatches/patches/gboard/shared/runtimeabi/RuntimeAbi.kt
+@@ -123,6 +123,7 @@ internal enum class RuntimeCallId(internal val encodedAbi: String) {
+     AI_WRITING_TOOLS_VOICE_COMMAND_RUNTIME_FINISH_GEN_AI_REFRESH("Ldev/jason/gboardpatches/extension/writingtools/GboardAiWritingToolsVoiceCommandRuntime;->finishGenAiRefresh(Ljava/lang/Object;)V"),
+     AI_WRITING_TOOLS_VOICE_COMMAND_RUNTIME_OBSERVE_GEN_AI_REFRESH_CLIENT_TYPE("Ldev/jason/gboardpatches/extension/writingtools/GboardAiWritingToolsVoiceCommandRuntime;->observeGenAiRefreshClientType(Ljava/lang/Object;Ljava/lang/Object;)V"),
+     AI_WRITING_TOOLS_VOICE_COMMAND_RUNTIME_REMEMBER_GEN_AI_INIT_CALL("Ldev/jason/gboardpatches/extension/writingtools/GboardAiWritingToolsVoiceCommandRuntime;->rememberGenAiInitCall(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V"),
++    IOS_BOTTOM_ROW_RUNTIME_AFTER_SOFT_KEY_BOUND("Ldev/jason/gboardpatches/extension/iosbottomrow/GboardIosBottomRowRuntime;->afterSoftKeyBound(Ljava/lang/Object;)V"),
+     ZHUYIN_BOTTOM_ROW_WEIGHT_RUNTIME_AFTER_SOFT_KEY_BOUND("Ldev/jason/gboardpatches/extension/zhuyinbottomrow/GboardZhuyinBottomRowWeightRuntime;->afterSoftKeyBound(Ljava/lang/Object;)V"),
+     ZHUYIN_SLIDE_RUNTIME_CLEAR_POINTER_STATE("Ldev/jason/gboardpatches/extension/zhuyinslide/GboardZhuyinSlideRuntime;->clearPointerState(Ljava/lang/Object;)V"),
+     ZHUYIN_SLIDE_RUNTIME_MAYBE_CAPTURE_AND_SHOULD_SUPPRESS_RETARGET("Ldev/jason/gboardpatches/extension/zhuyinslide/GboardZhuyinSlideRuntime;->maybeCaptureAndShouldSuppressRetarget(Ljava/lang/Object;Ljava/lang/Object;FF)Z"),
+diff --git a/patches/src/main/resources/gboard/gboard-port-product-catalog.json b/patches/src/main/resources/gboard/gboard-port-product-catalog.json
+index 7e57038..b977c37 100644
+--- a/patches/src/main/resources/gboard/gboard-port-product-catalog.json
++++ b/patches/src/main/resources/gboard/gboard-port-product-catalog.json
+@@ -1059,6 +1059,36 @@
+         }
+       ]
+     },
++    {
++      "feature_id": "ios_style_bottom_row",
++      "public_patch_name": "iOS-Style Bottom Row (English/Russian)",
++      "feature_marker": "dev.jason.gboardpatches.feature.ios_bottom_row",
++      "target_family_ids": [
++        "softkey.bind"
++      ],
++      "migration_scope": "version-sensitive",
++      "consumer_files": [
++        "patches/src/main/kotlin/dev/jason/gboardpatches/patches/gboard/features/iosbottomrow/GboardIosBottomRowFeatureMarkerPatch.kt",
++        "patches/src/main/kotlin/dev/jason/gboardpatches/patches/gboard/features/iosbottomrow/GboardIosBottomRowSoftKeyPatch.kt",
++        "patches/src/main/kotlin/dev/jason/gboardpatches/patches/gboard/registry/GboardPatchRegistry.kt",
++        "patches/src/main/kotlin/dev/jason/gboardpatches/patches/gboard/shared/GboardSoftKeyFamilyComposer.kt"
++      ],
++      "contributions": [
++        {
++          "contribution_id": "ios_style_bottom_row.soft_key",
++          "anchor_family_id": "soft_key_bind",
++          "phase": "after_stock",
++          "order": 350,
++          "required_bindings": [
++            "soft_key_bind",
++            "soft_key_metadata_type"
++          ],
++          "runtime_calls": [
++            "IOS_BOTTOM_ROW_RUNTIME_AFTER_SOFT_KEY_BOUND"
++          ]
++        }
++      ]
++    },
+     {
+       "feature_id": "key_shape_selection",
+       "public_patch_name": "Key Shape Selection",
+diff --git a/patches/src/main/resources/gboard/gboard-port-product-catalog.sha256 b/patches/src/main/resources/gboard/gboard-port-product-catalog.sha256
+index e6cd530..f795d26 100644
+--- a/patches/src/main/resources/gboard/gboard-port-product-catalog.sha256
++++ b/patches/src/main/resources/gboard/gboard-port-product-catalog.sha256
+@@ -1 +1 @@
+-bd377aea5b145af5fd2dc2eb8222a073b45a172bfcf58cd113015a745183cb37
+\ No newline at end of file
++feafdcd99aaa1161b8593c3bc20326e523fd85b470731e67e2b53e1acdf9b9db
+\ No newline at end of file
+diff --git a/patches/src/test/kotlin/dev/jason/gboardpatches/patches/gboard/registry/GboardPortProductCatalogContractTest.kt b/patches/src/test/kotlin/dev/jason/gboardpatches/patches/gboard/registry/GboardPortProductCatalogContractTest.kt
+index 6d6afa6..8953d04 100644
+--- a/patches/src/test/kotlin/dev/jason/gboardpatches/patches/gboard/registry/GboardPortProductCatalogContractTest.kt
++++ b/patches/src/test/kotlin/dev/jason/gboardpatches/patches/gboard/registry/GboardPortProductCatalogContractTest.kt
+@@ -19,6 +19,7 @@ import dev.jason.gboardpatches.patches.gboard.features.featureflags.gboardGramma
+ import dev.jason.gboardpatches.patches.gboard.features.featureflags.gboardInlineSuggestionsFlagValuePatch
+ import dev.jason.gboardpatches.patches.gboard.features.featureflags.gboardKeyShapeSelectionFlagValuePatch
+ import dev.jason.gboardpatches.patches.gboard.features.flowmode.gboardFlowModeFlagValuePatch
++import dev.jason.gboardpatches.patches.gboard.features.iosbottomrow.gboardIosBottomRowSoftKeyPatch
+ import dev.jason.gboardpatches.patches.gboard.features.ocr.gboardOcrFlagValuePatch
+ import dev.jason.gboardpatches.patches.gboard.features.quickinsert.gboardQuickInsertFlagValuePatch
+ import dev.jason.gboardpatches.patches.gboard.features.longpressquickactions.gboardLongPressQuickActionsSoftKeyPatch
+@@ -196,6 +197,27 @@ class GboardPortProductCatalogContractTest {
+         )
+     }
+ 
++    @Test
++    fun iosBottomRowHasNoDependencyOnTheZhuyinPatchOrRuntime() {
++        val patch = GboardPublishedPatchCatalog.morpheRegistrations.single { registered ->
++            registered.name == "iOS-Style Bottom Row (English/Russian)"
++        }
++        assertFalse(
++            patch.dependencies.any { dependency -> dependency === gboardZhuyinBottomRowWeightPatch },
++        )
++
++        val runtime = Files.readString(
++            repositoryRoot().resolve(
++                "extensions/extension/src/main/java/dev/jason/gboardpatches/extension/iosbottomrow/GboardIosBottomRowRuntime.java",
++            ),
++            StandardCharsets.UTF_8,
++        )
++        assertFalse(runtime.contains("GboardZhuyinBottomRowWeightRuntime"))
++        assertFalse(runtime.contains("zhuyinbottomrow"))
++        assertTrue(runtime.contains("key_pos_switch_to_symbol"))
++        assertTrue(runtime.contains("key_pos_switch_to_alpha"))
++    }
++
+     @Test
+     fun flagFamilyDeclaresSeventeenSelectedOnlyComposerCallsInCanonicalOrder() {
+         val flagContributions = features().flatMap { feature ->
+@@ -404,9 +426,9 @@ class GboardPortProductCatalogContractTest {
+         val byFeatureId = features().associateBy { feature -> feature["feature_id"].asString }
+         val registrations = GboardPublishedPatchCatalog.morpheRegistrations
+ 
+-        assertEquals(8, SOFT_KEY_FEATURE_CONTRACTS.size)
++        assertEquals(9, SOFT_KEY_FEATURE_CONTRACTS.size)
+         assertEquals(
+-            11,
++            12,
+             features().sumOf { feature ->
+                 feature.getAsJsonArray("contributions").count { contribution ->
+                     contribution.asJsonObject["anchor_family_id"].asString == "soft_key_bind"
+@@ -681,6 +703,7 @@ class GboardPortProductCatalogContractTest {
+             "grammar_checker" to "version-sensitive",
+             "incognito_mode_toggle" to "version-sensitive",
+             "inline_suggestions" to "version-sensitive",
++            "ios_style_bottom_row" to "version-sensitive",
+             "key_shape_selection" to "version-sensitive",
+             "lan_ftp_server" to "version-neutral-extension",
+             "latin_globe_key_ignore_interval" to "version-sensitive",
+@@ -860,6 +883,13 @@ class GboardPortProductCatalogContractTest {
+                 "gboardSpacebarLogoSoftKeyPatch",
+                 FEATURE_ROOT + "spacebarlogo/GboardSpacebarLogoSoftKeyPatch.kt",
+             ),
++            SoftKeyFeatureContract(
++                "ios_style_bottom_row",
++                GboardSoftKeyFamilyFeature.IOS_BOTTOM_ROW,
++                gboardIosBottomRowSoftKeyPatch,
++                "gboardIosBottomRowSoftKeyPatch",
++                FEATURE_ROOT + "iosbottomrow/GboardIosBottomRowSoftKeyPatch.kt",
++            ),
+             SoftKeyFeatureContract(
+                 "long_press_editing_shortcuts",
+                 GboardSoftKeyFamilyFeature.LONG_PRESS_QUICK_ACTIONS,
