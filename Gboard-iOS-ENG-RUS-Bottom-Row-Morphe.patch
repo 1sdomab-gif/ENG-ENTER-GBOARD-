@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000..293c1b9
 --- /dev/null
 +++ b/extensions/extension/src/main/java/dev/jason/gboardpatches/extension/iosbottomrow/GboardIosBottomRowRuntime.java
-@@ -0,0 +1,244 @@
+@@ -0,0 +1,252 @@
 +package dev.jason.gboardpatches.extension.iosbottomrow;
 +
 +import android.content.Context;
