@@ -25,16 +25,36 @@ jobs:
           ref: 976b7495da1cc94a30ae5007a62ab6e6d28fcfba
           path: gboard-patches
 
-      - name: Verify and normalize Morphe registry URL
+      - name: Verify patch and normalize Morphe registry URL
         shell: bash
         run: |
           set -euo pipefail
           SETTINGS="$GITHUB_WORKSPACE/gboard-patches/settings.gradle.kts"
           PATCH="$GITHUB_WORKSPACE/Gboard-iOS-ENG-RUS-Bottom-Row-Morphe-FIXED-1.patch"
-          test -f "$SETTINGS"
-          test -f "$PATCH"
+          test -f "$SETTINGS" || { echo "::error::settings.gradle.kts not found"; exit 1; }
+          test -f "$PATCH" || { echo "::error::Patch file not found"; exit 1; }
           sed -i 's#https://maven.pkg.github.com/MorpheApp/registry#https://maven.pkg.github.com/morpheapp/registry#g' "$SETTINGS"
           grep -F 'https://maven.pkg.github.com/morpheapp/registry' "$SETTINGS"
+
+      - name: Check access to Morphe Gradle plugin
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.MORPHE_GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${GITHUB_TOKEN:-}" ]; then
+            echo "::error::MORPHE_GITHUB_TOKEN is empty or unavailable to this workflow."
+            exit 1
+          fi
+          URL="https://maven.pkg.github.com/morpheapp/registry/app/morphe/patches/app.morphe.patches.gradle.plugin/1.3.3/app.morphe.patches.gradle.plugin-1.3.3.pom"
+          CODE=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            --user "$GITHUB_ACTOR:$GITHUB_TOKEN" "$URL")
+          echo "Morphe plugin POM HTTP status: $CODE"
+          if [ "$CODE" != "200" ]; then
+            echo "::error::Cannot read the Morphe plugin POM. HTTP $CODE. Do not post the token in logs or chat."
+            exit 1
+          fi
 
       - name: Apply EN/RU patch
         working-directory: gboard-patches
@@ -63,7 +83,7 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x ./gradlew
-          ./gradlew :patches:buildAndroid generatePatchesList
+          ./gradlew :patches:buildAndroid generatePatchesList --stacktrace
 
       - name: Upload Morphe bundle
         uses: actions/upload-artifact@v4
