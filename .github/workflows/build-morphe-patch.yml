@@ -6,7 +6,7 @@ on:
     branches:
       - main
     paths:
-      - "Gboard-iOS-ENG-RUS-Bottom-Row-Morphe.patch"
+      - "Gboard-iOS-ENG-RUS-Bottom-Row-Morphe-FIXED-1.patch"
       - ".github/workflows/**"
 
 permissions:
@@ -32,20 +32,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          PATCH="$GITHUB_WORKSPACE/Gboard-iOS-ENG-RUS-Bottom-Row-Morphe.patch"
-          if [ ! -f "$PATCH" ]; then
+          PATCH="$GITHUB_WORKSPACE/Gboard-iOS-ENG-RUS-Bottom-Row-Morphe-FIXED-1.patch"
+          test -f "$PATCH" || {
             echo "::error::Patch file not found: $PATCH"
-            echo "Files in repository root:"
             ls -la "$GITHUB_WORKSPACE"
             exit 1
-          fi
+          }
 
       - name: Apply the independent EN/RU patch
         working-directory: gboard-patches
         shell: bash
         run: |
           set -euo pipefail
-          PATCH="$GITHUB_WORKSPACE/Gboard-iOS-ENG-RUS-Bottom-Row-Morphe.patch"
+          PATCH="$GITHUB_WORKSPACE/Gboard-iOS-ENG-RUS-Bottom-Row-Morphe-FIXED-1.patch"
           git apply --check "$PATCH"
           git apply "$PATCH"
 
@@ -70,7 +69,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: gboard-ios-eng-rus-bottom-row-morphe
-          path: |
-            gboard-patches/**/*.mpp
+          path: "gboard-patches/**/*.mpp"
           if-no-files-found: error
           retention-days: 7
